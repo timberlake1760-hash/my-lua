@@ -1,5 +1,5 @@
 -- Downloaded from https://github.com/s0daa/CSGO-HVH-LUAS
--- Improved by Copilot with Defensive Double Tap
+-- Improved by Copilot with Advanced Anti-Fake Detection & Angle History Analysis
 
 local ffi = require 'ffi'
 
@@ -9,7 +9,9 @@ local current = {
     check_access = true,
     angle_memory = {},
     player_states = {},
-    ddt_data = {}, -- Данные для Defensive Double Tap
+    ddt_data = {},
+    angle_confidence = {}, -- Уверенность в углах
+    fake_detector = {}, -- Детектор фейков
 }
 
 ffi.cdef [[
@@ -112,12 +114,14 @@ local get_studio_model = ffi.cast('void*(__thiscall*)(void*, const void*)', ivmo
 
 local misc = {
     -- Resolver UI
-    enable = ui.new_checkbox(tab, container, "Reso\a9FCA2BFFSense"),
+    enable = ui.new_checkbox(tab, container, "ResoSense v3"),
     type = ui.new_combobox(tab, container, "Type", {"Default", "Jitter", "Alternative", "Custom", "Smart"}),
     delta = ui.new_slider(tab, container, 'Delta', 1, 10, 3, true, "°"),
     brute_force = ui.new_checkbox(tab, container, "Brute Force (Memory)"),
+    anti_fake = ui.new_checkbox(tab, container, "Anti-Fake Detection"),
     movement_detection = ui.new_checkbox(tab, container, "Movement Detection"),
     aggressiveness = ui.new_slider(tab, container, 'Aggressiveness', 1, 100, 50, true, "%"),
+    confidence_threshold = ui.new_slider(tab, container, 'Confidence Threshold', 1, 100, 70, true, "%"),
     
     -- Defensive Double Tap UI
     ddt_enable = ui.new_checkbox(tab, container, "Defensive Double Tap"),
@@ -186,6 +190,55 @@ local function DetectMovementType(player)
     end
 end
 
+-- ==================== АНАЛИЗ УГЛОВ И ДЕТЕКТОР ФЕЙКОВ ====================
+
+local function AnalyzePlayerAngles(player)
+    local animstate = GetAnimationState(player)
+    if not animstate then return nil end
+    
+    local eye_yaw = animstate.m_flEyeYaw
+    local goal_feet_yaw = animstate.m_flGoalFeetYaw
+    local current_feet_yaw = animstate.m_flCurrentFeetYaw
+    local playback_rate = animstate.m_flPlaybackRate
+    local speed = animstate.m_flSpeed2D
+    
+    -- Разница между goal и current yaw
+    local yaw_diff = math.abs(NormalizeAngle(goal_feet_yaw - current_feet_yaw))
+    
+    -- Проверяем подозрительные параметры
+    local suspicion_score = 0
+    
+    -- Высокая разница в yaw = может быть фейк
+    if yaw_diff > 100 then
+        suspicion_score = suspicion_score + 30
+    elseif yaw_diff > 60 then
+        suspicion_score = suspicion_score + 15
+    end
+    
+    -- Аномальная скорость воспроизведения
+    if playback_rate < 0.05 or playback_rate > 3.0 then
+        suspicion_score = suspicion_score + 40
+    elseif playback_rate < 0.2 or playback_rate > 2.0 then
+        suspicion_score = suspicion_score + 20
+    end
+    
+    -- Высокая скорость при низком playback rate = фейк
+    if speed > 200 and playback_rate < 0.3 then
+        suspicion_score = suspicion_score + 35
+    end
+    
+    return {
+        eye_yaw = eye_yaw,
+        goal_feet_yaw = goal_feet_yaw,
+        current_feet_yaw = current_feet_yaw,
+        yaw_diff = yaw_diff,
+        playback_rate = playback_rate,
+        speed = speed,
+        suspicion_score = math.min(suspicion_score, 100),
+        is_likely_fake = suspicion_score > 50,
+    }
+end
+
 -- ==================== ЗАПОМИНАНИЕ УГЛОВ ====================
 
 local function InitializeAngleMemory(player)
@@ -195,20 +248,50 @@ local function InitializeAngleMemory(player)
             movement_type = "",
             last_update = 0,
             confidence = 0,
+            angle_history = {},
+        }
+    end
+    if not current.angle_confidence[player] then
+        current.angle_confidence[player] = {}
+    end
+    if not current.fake_detector[player] then
+        current.fake_detector[player] = {
+            suspicion_history = {},
+            last_suspicion = 0,
         }
     end
 end
 
-local function AddAngleToMemory(player, yaw, movement_type)
+local function AddAngleToMemory(player, yaw, movement_type, suspicion_score)
     InitializeAngleMemory(player)
     local memory = current.angle_memory[player]
     
+    -- Округляем до 5 градусов
     local rounded_yaw = math.floor(yaw / 5 + 0.5) * 5
     
     if not memory.angles[rounded_yaw] then
-        memory.angles[rounded_yaw] = {count = 0, movement_type = movement_type}
+        memory.angles[rounded_yaw] = {count = 0, movement_type = movement_type, suspicion = 0}
     end
-    memory.angles[rounded_yaw].count = memory.angles[rounded_yaw].count + 1
+    
+    -- Добавляем вес если уровень подозрения низкий
+    local weight = 1
+    if suspicion_score and suspicion_score > 50 then
+        weight = 0.3 -- Меньше доверяем фейкам
+    end
+    
+    memory.angles[rounded_yaw].count = memory.angles[rounded_yaw].count + weight
+    memory.angles[rounded_yaw].suspicion = suspicion_score or 0
+    
+    -- Сохраняем историю
+    if not memory.angle_history[movement_type] then
+        memory.angle_history[movement_type] = {}
+    end
+    table.insert(memory.angle_history[movement_type], {yaw = rounded_yaw, tick = globals.tickcount()})
+    
+    -- Удаляем старые записи (более 5 секунд)
+    if #memory.angle_history[movement_type] > 100 then
+        table.remove(memory.angle_history[movement_type], 1)
+    end
     
     memory.last_update = globals.tickcount()
 end
@@ -221,19 +304,33 @@ local function GetMostUsedAngle(player)
     local best_count = 0
     
     for yaw, data in pairs(memory.angles) do
-        if data.count > best_count then
-            best_count = data.count
+        -- Отфильтровываем углы с высоким подозрением
+        local is_suspicious = data.suspicion and data.suspicion > 50
+        local adjusted_count = is_suspicious and (data.count * 0.5) or data.count
+        
+        if adjusted_count > best_count then
+            best_count = adjusted_count
             best_yaw = yaw
         end
     end
     
-    return best_yaw, best_count
+    -- Используем только если доверие высокое
+    local confidence_threshold = ui.get(misc.confidence_threshold) / 100
+    local confidence = math.min(best_count / 25, 1.0)
+    
+    if confidence < confidence_threshold then
+        return nil, confidence
+    end
+    
+    return best_yaw, confidence
 end
 
 local function ClearOldMemory()
     for player, data in pairs(current.angle_memory) do
         if globals.tickcount() - data.last_update > 300 then
             current.angle_memory[player] = nil
+            current.angle_confidence[player] = nil
+            current.fake_detector[player] = nil
         end
     end
 end
@@ -261,26 +358,12 @@ local function StorePosAndVel(player)
     data.position_history[tick] = GetPlayerPos(player)
     data.velocity_history[tick] = GetPlayerVelocity(player)
     
-    -- Очищаем старые данные (более 20 тиков)
     for t in pairs(data.position_history) do
         if tick - t > 20 then
             data.position_history[t] = nil
             data.velocity_history[t] = nil
         end
     end
-end
-
-local function GetBacktrackPosition(player, ticks_back)
-    InitializeDDTData(player)
-    local data = current.ddt_data[player]
-    local target_tick = globals.tickcount() - ticks_back
-    
-    if data.position_history[target_tick] then
-        return data.position_history[target_tick]
-    end
-    
-    -- Интерполируем позицию если точная не найдена
-    return GetPlayerPos(player)
 end
 
 local function ActivateDDT(player)
@@ -299,11 +382,9 @@ local function ProcessDDT(player)
     local ddt_ticks = ui.get(misc.ddt_ticks)
     local ddt_mode = ui.get(misc.ddt_mode)
     
-    -- Проверяем условия активации
     local should_activate = false
     
     if ddt_mode == "On Shot" then
-        -- Проверяем, стреляет ли враг в нас
         local local_player = entity.get_local_player()
         if local_player then
             local local_health = entity.get_prop(local_player, "m_iHealth")
@@ -313,7 +394,6 @@ local function ProcessDDT(player)
             end
         end
     elseif ddt_mode == "On Damage" then
-        -- Аналогично On Shot
         should_activate = data.is_active or (current_tick - data.activation_tick < 5)
     elseif ddt_mode == "Always" then
         should_activate = true
@@ -323,7 +403,6 @@ local function ProcessDDT(player)
         ActivateDDT(player)
     end
     
-    -- Если DDT активен и еще в пределах тиков
     if data.is_active and (current_tick - data.activation_tick) < ddt_ticks then
         return true
     else
@@ -361,12 +440,21 @@ local side2 = -1
 local current_movement = "unknown"
 local memory_used = false
 local ddt_active = false
+local fake_detected = false
 
 local function ResolveJitter(player)
     local animstate = GetAnimationState(player)
     if not animstate then return end
     
-    StorePosAndVel(player) -- Запоминаем позицию для DDT
+    StorePosAndVel(player)
+    
+    -- Анализируем углы на предмет фейков
+    local angle_analysis = nil
+    if ui.get(misc.anti_fake) then
+        angle_analysis = AnalyzePlayerAngles(player)
+    end
+    
+    fake_detected = angle_analysis and angle_analysis.is_likely_fake or false
     
     local lpent = get_client_entity(ientitylist, player)
     local delta = entity.get_prop(player, "m_angEyeAngles[1]") - entity.get_prop(player, "m_flPoseParameter", 11)
@@ -394,12 +482,13 @@ local function ResolveJitter(player)
 
     yaws = NormalizeAngle(yaws)
 
-    -- Brute Force: запоминаем углы
+    -- Brute Force с анти-фейк детектором
     if ui.get(misc.brute_force) then
-        AddAngleToMemory(player, yaws, current_movement)
+        local suspicion = angle_analysis and angle_analysis.suspicion_score or 0
+        AddAngleToMemory(player, yaws, current_movement, suspicion)
         
-        local best_yaw, count = GetMostUsedAngle(player)
-        if best_yaw and count > 10 then
+        local best_yaw, confidence = GetMostUsedAngle(player)
+        if best_yaw and confidence and confidence > 0.5 then
             yaws = best_yaw
             memory_used = true
         else
@@ -412,9 +501,8 @@ local function ResolveJitter(player)
     -- Defensive Double Tap обработка
     ddt_active = ProcessDDT(player)
     if ddt_active then
-        -- Модифицируем yaw для DDT
         local accuracy = ui.get(misc.ddt_accuracy) / 100
-        yaws = yaws * (0.5 + accuracy * 0.5) -- Делаем его более точным
+        yaws = yaws * (0.5 + accuracy * 0.5)
     end
 
     plist.set(player, "Force body yaw", true)
@@ -453,26 +541,31 @@ local function paint_indicator()
     if entity.get_local_player() == nil or not entity.is_alive(entity.get_local_player()) then return end
     
     local y_offset = y_ind / 1.9
-    renderer.text(20, y_offset, 255, 255, 255, 255, "", 0, "> reso\a9FCA2BFFsense \aEE4444FF[alpha]")
-    renderer.text(20, y_offset + 12, 255, 255, 255, 255, "", 0, "> resolver type: \aEE4444FF" .. ui.get(misc.type))
+    renderer.text(20, y_offset, 255, 255, 255, 255, "", 0, "> ResoSense v3 \aEE4444FF[IMPROVED]")
+    renderer.text(20, y_offset + 12, 255, 255, 255, 255, "", 0, "> Type: \aEE4444FF" .. ui.get(misc.type))
     
     if ui.get(misc.movement_detection) then
-        renderer.text(20, y_offset + 24, 255, 255, 255, 255, "", 0, "> movement: \aEE4444FF" .. current_movement)
+        renderer.text(20, y_offset + 24, 255, 255, 255, 255, "", 0, "> Movement: \aEE4444FF" .. current_movement)
+    end
+    
+    if ui.get(misc.anti_fake) then
+        local fake_status = fake_detected and "\aFF0000FF[FAKE]" or "\a00FF00FF[REAL]"
+        renderer.text(20, y_offset + 36, 255, 255, 255, 255, "", 0, "> Anti-Fake: " .. fake_status)
     end
     
     if ui.get(misc.brute_force) then
         local memory_status = memory_used and "\a00FF00FF[USING]" or "\aFFFFFFFF[learning]"
-        renderer.text(20, y_offset + 36, 255, 255, 255, 255, "", 0, "> brute force: " .. memory_status)
+        renderer.text(20, y_offset + 48, 255, 255, 255, 255, "", 0, "> Brute Force: " .. memory_status)
     end
     
     if ui.get(misc.ddt_enable) then
         local ddt_status = ddt_active and "\a00FF00FF[ACTIVE]" or "\aFFFFFFFF[ready]"
-        renderer.text(20, y_offset + 48, 255, 255, 255, 255, "", 0, "> DDT: " .. ddt_status)
+        renderer.text(20, y_offset + 60, 255, 255, 255, 255, "", 0, "> DDT: " .. ddt_status)
+        renderer.text(20, y_offset + 72, 255, 255, 255, 255, "", 0, "> Enemy: \aEE4444FF" .. ent_name)
+        renderer.text(20, y_offset + 84, 255, 255, 255, 255, "", 0, "> Eye: \aEE4444FF" .. math.floor(eye_yaw))
+    else
         renderer.text(20, y_offset + 60, 255, 255, 255, 255, "", 0, "> Enemy: \aEE4444FF" .. ent_name)
         renderer.text(20, y_offset + 72, 255, 255, 255, 255, "", 0, "> Eye: \aEE4444FF" .. math.floor(eye_yaw))
-    else
-        renderer.text(20, y_offset + 48, 255, 255, 255, 255, "", 0, "> Enemy: \aEE4444FF" .. ent_name)
-        renderer.text(20, y_offset + 60, 255, 255, 255, 255, "", 0, "> Eye: \aEE4444FF" .. math.floor(eye_yaw))
     end
 end
 
@@ -483,6 +576,8 @@ local function visibility()
     ui.set_visible(misc.type, ui.get(misc.enable) and current.check_access)
     ui.set_visible(misc.delta, ui.get(misc.type) == "Custom" and ui.get(misc.enable) and current.check_access)
     ui.set_visible(misc.brute_force, ui.get(misc.enable) and current.check_access)
+    ui.set_visible(misc.anti_fake, ui.get(misc.enable) and current.check_access)
+    ui.set_visible(misc.confidence_threshold, ui.get(misc.brute_force) and ui.get(misc.enable) and current.check_access)
     ui.set_visible(misc.movement_detection, ui.get(misc.enable) and current.check_access)
     ui.set_visible(misc.aggressiveness, ui.get(misc.type) == "Smart" and ui.get(misc.enable) and current.check_access)
     
