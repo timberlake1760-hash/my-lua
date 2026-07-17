@@ -1,98 +1,20 @@
--- Downloaded from https://github.com/s0daa/CSGO-HVH-LUAS
--- Improved by Copilot with Advanced Anti-Fake Detection & Angle History Analysis
+-- GameSense Lua Aimbot with Logging
+-- Custom aimbot script with prediction, target filtering and detailed logs
 
 local ffi = require 'ffi'
 
-local tab, container = "Rage", "Other"
+local tab, container = "Rage", "Aimbot"
 
-local current = {
+local aimbot_config = {
     check_access = true,
-    angle_memory = {},
-    player_states = {},
-    ddt_data = {},
-    angle_confidence = {}, -- Уверенность в углах
-    fake_detector = {}, -- Детектор фейков
+    target_data = {},
+    shot_log = {}, -- Логи выстрелов
+    max_log_entries = 100,
 }
 
 ffi.cdef [[
-    struct animation_layer_t {
-		bool m_bClientBlend;
-		float m_flBlendIn;
-		void* m_pStudioHdr;
-		int m_nDispatchSequence;
-		int m_nDispatchSequence_2;
-		uint32_t m_nOrder;
-		uint32_t m_nSequence;
-		float m_flPrevCycle;
-		float m_flWeight;
-		float m_flWeightDeltaRate;
-		float m_flPlaybackRate;
-		float m_flCycle;
-		void* m_pOwner;
-		char pad_0038[4];
-    };
-    struct c_animstate { 
-        char pad[ 3 ];
-        char m_bForceWeaponUpdate;
-        char pad1[ 91 ];
-        void* m_pBaseEntity;
-        void* m_pActiveWeapon;
-        void* m_pLastActiveWeapon;
-        float m_flPrevCycle;
-        float m_flWeight;
-        float m_flWeightDeltaRate;
-        float m_flPlaybackRate;
-        float m_flLastClientSideAnimationUpdateTime;
-        int m_iLastClientSideAnimationUpdateFramecount;
-        float m_flAnimUpdateDelta;
-        float m_flEyeYaw;
-        float m_flPitch;
-        float m_flGoalFeetYaw;
-        float m_flCurrentFeetYaw;
-        float m_flCurrentTorsoYaw;
-        float m_flUnknownVelocityLean;
-        float m_flLeanAmount;
-        char pad2[ 4 ];
-        float m_flFeetCycle;
-        float m_flFeetYawRate;
-        char pad3[ 4 ];
-        float m_fDuckAmount;
-        float m_fLandingDuckAdditiveSomething;
-        char pad4[ 4 ];
-        float m_vOriginX;
-        float m_vOriginY;
-        float m_vOriginZ;
-        float m_vLastOriginX;
-        float m_vLastOriginY;
-        float m_vLastOriginZ;
-        float m_vVelocityX;
-        float m_vVelocityY;
-        char pad5[ 4 ];
-        float m_flUnknownFloat1;
-        char pad6[ 8 ];
-        float m_flUnknownFloat2;
-        float m_flUnknownFloat3;
-        float m_flUnknown;
-        float m_flSpeed2D;
-        float m_flUpVelocity;
-        float m_flSpeedNormalized;
-        float m_flFeetSpeedForwardsOrSideWays;
-        float m_flFeetSpeedUnknownForwardOrSideways;
-        float m_flTimeSinceStartedMoving;
-        float m_flTimeSinceStoppedMoving;
-        bool m_bOnGround;
-        bool m_bInHitGroundAnimation;
-        float m_flTimeSinceInAir;
-        float m_flLastOriginZ;
-        float m_flHeadHeightOrOffsetFromHittingGroundAnimation;
-        float m_flStopToFullRunningFraction;
-        char pad7[ 4 ];
-        float m_flMagicFraction;
-        char pad8[ 60 ];
-        float m_flWorldForce;
-        char pad9[ 462 ];
-        float m_flMaxYaw;
-        float m_flMinYaw;
+    struct vector_t {
+        float x, y, z;
     };
 ]]
 
@@ -101,56 +23,108 @@ local rawientitylist = client.create_interface('client.dll', 'VClientEntityList0
                            error('VClientEntityList003 wasnt found', 2)
 
 local ientitylist = ffi.cast(classptr, rawientitylist) or error('rawientitylist is nil', 2)
-local get_client_networkable = ffi.cast('void*(__thiscall*)(void*, int)', ientitylist[0][0]) or
-                                   error('get_client_networkable_t is nil', 2)
 local get_client_entity = ffi.cast('void*(__thiscall*)(void*, int)', ientitylist[0][3]) or
                               error('get_client_entity is nil', 2)
 
-local rawivmodelinfo = client.create_interface('engine.dll', 'VModelInfoClient004')
-local ivmodelinfo = ffi.cast(classptr, rawivmodelinfo) or error('rawivmodelinfo is nil', 2)
-local get_studio_model = ffi.cast('void*(__thiscall*)(void*, const void*)', ivmodelinfo[0][32])
-
 -- ==================== UI ЭЛЕМЕНТЫ ====================
 
-local misc = {
-    -- Resolver UI
-    enable = ui.new_checkbox(tab, container, "ResoSense v3"),
-    type = ui.new_combobox(tab, container, "Type", {"Default", "Jitter", "Alternative", "Custom", "Smart"}),
-    delta = ui.new_slider(tab, container, 'Delta', 1, 10, 3, true, "°"),
-    brute_force = ui.new_checkbox(tab, container, "Brute Force (Memory)"),
-    anti_fake = ui.new_checkbox(tab, container, "Anti-Fake Detection"),
-    movement_detection = ui.new_checkbox(tab, container, "Movement Detection"),
-    aggressiveness = ui.new_slider(tab, container, 'Aggressiveness', 1, 100, 50, true, "%"),
-    confidence_threshold = ui.new_slider(tab, container, 'Confidence Threshold', 1, 100, 70, true, "%"),
+local aimbot_ui = {
+    -- Основные опции
+    enable = ui.new_checkbox(tab, container, "Enable Aimbot"),
+    mode = ui.new_combobox(tab, container, "Mode", {"Silent", "Smooth", "Flick"}),
+    fov = ui.new_slider(tab, container, "FOV", 1, 180, 45, true, "°"),
+    smoothness = ui.new_slider(tab, container, "Smoothness", 1, 100, 35, true, "%"),
     
-    -- Defensive Double Tap UI
-    ddt_enable = ui.new_checkbox(tab, container, "Defensive Double Tap"),
-    ddt_mode = ui.new_combobox(tab, container, "DDT Mode", {"On Shot", "On Damage", "Always"}),
-    ddt_ticks = ui.new_slider(tab, container, "DDT Ticks", 1, 16, 8, true, "t"),
-    ddt_accuracy = ui.new_slider(tab, container, "DDT Accuracy", 1, 100, 75, true, "%"),
+    -- Целеполагание
+    target_bone = ui.new_combobox(tab, container, "Target Bone", {"Head", "Neck", "Chest", "Best"}),
+    prediction = ui.new_checkbox(tab, container, "Enable Prediction"),
+    prediction_strength = ui.new_slider(tab, container, "Prediction Strength", 1, 100, 60, true, "%"),
+    
+    -- Фильтрация
+    only_visible = ui.new_checkbox(tab, container, "Only Visible"),
+    only_alive = ui.new_checkbox(tab, container, "Only Alive"),
+    skip_teammates = ui.new_checkbox(tab, container, "Skip Teammates"),
+    min_health = ui.new_slider(tab, container, "Min Enemy Health", 1, 100, 1, true, "HP"),
+    
+    -- Расширенные опции
+    dynamic_smoothness = ui.new_checkbox(tab, container, "Dynamic Smoothness"),
+    distance_smoothing = ui.new_checkbox(tab, container, "Distance Smoothing"),
+    recoil_control = ui.new_slider(tab, container, "Recoil Control", 0, 100, 50, true, "%"),
+    
+    -- Логирование
+    enable_logging = ui.new_checkbox(tab, container, "Enable Aimbot Logging"),
+    log_detail_level = ui.new_combobox(tab, container, "Log Detail", {"Brief", "Normal", "Detailed"}),
+    show_log_panel = ui.new_checkbox(tab, container, "Show Log Panel"),
 }
 
+-- ==================== ЛОГИРОВАНИЕ ====================
+
+local function AddShotLog(log_data)
+    if not ui.get(aimbot_ui.enable_logging) then return end
+    
+    table.insert(aimbot_config.shot_log, {
+        tick = globals.tickcount(),
+        timestamp = os.time(),
+        target = log_data.target or "Unknown",
+        distance = log_data.distance or 0,
+        fov_angle = log_data.fov_angle or 0,
+        predicted_angles = log_data.predicted_angles or {pitch = 0, yaw = 0},
+        final_angles = log_data.final_angles or {pitch = 0, yaw = 0},
+        mode = log_data.mode or "Unknown",
+        bone = log_data.bone or "Unknown",
+        hit = log_data.hit or false,
+        reason = log_data.reason or "Normal shot",
+        prediction_used = log_data.prediction_used or false,
+        smoothness_applied = log_data.smoothness_applied or 0,
+    })
+    
+    -- Удаляем старые логи
+    if #aimbot_config.shot_log > aimbot_config.max_log_entries then
+        table.remove(aimbot_config.shot_log, 1)
+    end
+end
+
+local function GetLogString(log_entry)
+    local detail_level = ui.get(aimbot_ui.log_detail_level)
+    
+    if detail_level == "Brief" then
+        return string.format("[%d] %s | %.0fu | Hit: %s", 
+            log_entry.tick,
+            log_entry.target,
+            log_entry.distance,
+            log_entry.hit and "✓" or "✗"
+        )
+    elseif detail_level == "Normal" then
+        return string.format("[%d] %s | %.0fu | FOV: %.1f° | Pitch: %.1f° | Yaw: %.1f° | Hit: %s",
+            log_entry.tick,
+            log_entry.target,
+            log_entry.distance,
+            log_entry.fov_angle,
+            log_entry.final_angles.pitch,
+            log_entry.final_angles.yaw,
+            log_entry.hit and "✓" or "✗"
+        )
+    else -- Detailed
+        return string.format("[%d] %s | %.0fu | FOV: %.1f° | Mode: %s | Bone: %s\n    Predicted: P:%.1f° Y:%.1f° | Final: P:%.1f° Y:%.1f°\n    Pred: %s | Smooth: %.0f%% | Hit: %s | Reason: %s",
+            log_entry.tick,
+            log_entry.target,
+            log_entry.distance,
+            log_entry.fov_angle,
+            log_entry.mode,
+            log_entry.bone,
+            log_entry.predicted_angles.pitch,
+            log_entry.predicted_angles.yaw,
+            log_entry.final_angles.pitch,
+            log_entry.final_angles.yaw,
+            log_entry.prediction_used and "✓" or "✗",
+            log_entry.smoothness_applied,
+            log_entry.hit and "✓" or "✗",
+            log_entry.reason
+        )
+    end
+end
+
 -- ==================== УТИЛИТЫ ====================
-
-local function NormalizeAngle(angle)
-    while angle > 180 do
-        angle = angle - 360
-    end
-    while angle < -180 do
-        angle = angle + 360
-    end
-    return angle
-end
-
-local function GetAnimationState(player)
-    if not (player) then
-        return
-    end
-    local player_ptr = ffi.cast("void***", get_client_entity(ientitylist, player))
-    local animstate_ptr = ffi.cast("char*", player_ptr) + 0x9960
-    local state = ffi.cast("struct c_animstate**", animstate_ptr)[0]
-    return state
-end
 
 local function GetPlayerPos(player)
     local x = entity.get_prop(player, "m_vecOrigin[0]")
@@ -166,430 +140,354 @@ local function GetPlayerVelocity(player)
     return {x = vx, y = vy, z = vz}
 end
 
--- ==================== ДВИЖЕНИЕ ====================
-
-local function DetectMovementType(player)
-    local animstate = GetAnimationState(player)
-    if not animstate then return "unknown" end
+local function GetBonePos(player, bone)
+    local bones = {
+        Head = 8,
+        Neck = 1,
+        Chest = 6,
+    }
     
-    local speed = animstate.m_flSpeed2D
-    local is_in_air = animstate.m_flTimeSinceInAir > 0.1
-    local on_ground = animstate.m_bOnGround
-    local in_hit_ground = animstate.m_bInHitGroundAnimation
-    
-    if is_in_air and not on_ground then
-        return "jumping"
-    elseif in_hit_ground or animstate.m_flTimeSinceInAir < 0.5 then
-        return "landing"
-    elseif speed > 150 then
-        return "running"
-    elseif speed > 50 then
-        return "walking"
-    else
-        return "standing"
+    if bone == "Best" then
+        local dist = GetDistance(entity.get_local_player(), player)
+        if dist < 1000 then
+            return entity.get_player_weapon_offset(player, 8)
+        else
+            return entity.get_player_weapon_offset(player, 6)
+        end
     end
+    
+    local bone_id = bones[bone] or 8
+    return entity.get_player_weapon_offset(player, bone_id)
 end
 
--- ==================== АНАЛИЗ УГЛОВ И ДЕТЕКТОР ФЕЙКОВ ====================
+local function GetDistance(player1, player2)
+    local pos1 = GetPlayerPos(player1)
+    local pos2 = GetPlayerPos(player2)
+    
+    local dx = pos1.x - pos2.x
+    local dy = pos1.y - pos2.y
+    local dz = pos1.z - pos2.z
+    
+    return math.sqrt(dx*dx + dy*dy + dz*dz)
+end
 
-local function AnalyzePlayerAngles(player)
-    local animstate = GetAnimationState(player)
-    if not animstate then return nil end
+local function GetAnglesToPos(from_pos, to_pos)
+    local dx = to_pos.x - from_pos.x
+    local dy = to_pos.y - from_pos.y
+    local dz = to_pos.z - from_pos.z
     
-    local eye_yaw = animstate.m_flEyeYaw
-    local goal_feet_yaw = animstate.m_flGoalFeetYaw
-    local current_feet_yaw = animstate.m_flCurrentFeetYaw
-    local playback_rate = animstate.m_flPlaybackRate
-    local speed = animstate.m_flSpeed2D
+    local distance = math.sqrt(dx*dx + dy*dy + dz*dz)
     
-    -- Разница между goal и current yaw
-    local yaw_diff = math.abs(NormalizeAngle(goal_feet_yaw - current_feet_yaw))
+    local pitch = -math.deg(math.atan(dz / math.sqrt(dx*dx + dy*dy)))
+    local yaw = math.deg(math.atan2(dy, dx))
     
-    -- Проверяем подозрительные параметры
-    local suspicion_score = 0
-    
-    -- Высокая разница в yaw = может быть фейк
-    if yaw_diff > 100 then
-        suspicion_score = suspicion_score + 30
-    elseif yaw_diff > 60 then
-        suspicion_score = suspicion_score + 15
+    return {pitch = pitch, yaw = yaw, distance = distance}
+end
+
+local function NormalizeAngle(angle)
+    while angle > 180 do
+        angle = angle - 360
     end
-    
-    -- Аномальная скорость воспроизведения
-    if playback_rate < 0.05 or playback_rate > 3.0 then
-        suspicion_score = suspicion_score + 40
-    elseif playback_rate < 0.2 or playback_rate > 2.0 then
-        suspicion_score = suspicion_score + 20
+    while angle < -180 do
+        angle = angle + 360
     end
+    return angle
+end
+
+-- ==================== ПРЕДСКАЗАНИЕ ====================
+
+local function PredictPlayerPos(player, ticks_ahead)
+    local pos = GetPlayerPos(player)
+    local vel = GetPlayerVelocity(player)
+    local tick_time = globals.tickinterval()
     
-    -- Высокая скорость при низком playback rate = фейк
-    if speed > 200 and playback_rate < 0.3 then
-        suspicion_score = suspicion_score + 35
-    end
+    local prediction_time = ticks_ahead * tick_time
     
     return {
-        eye_yaw = eye_yaw,
-        goal_feet_yaw = goal_feet_yaw,
-        current_feet_yaw = current_feet_yaw,
-        yaw_diff = yaw_diff,
-        playback_rate = playback_rate,
-        speed = speed,
-        suspicion_score = math.min(suspicion_score, 100),
-        is_likely_fake = suspicion_score > 50,
+        x = pos.x + vel.x * prediction_time,
+        y = pos.y + vel.y * prediction_time,
+        z = pos.z + vel.z * prediction_time,
     }
 end
 
--- ==================== ЗАПОМИНАНИЕ УГЛОВ ====================
-
-local function InitializeAngleMemory(player)
-    if not current.angle_memory[player] then
-        current.angle_memory[player] = {
-            angles = {},
-            movement_type = "",
-            last_update = 0,
-            confidence = 0,
-            angle_history = {},
-        }
-    end
-    if not current.angle_confidence[player] then
-        current.angle_confidence[player] = {}
-    end
-    if not current.fake_detector[player] then
-        current.fake_detector[player] = {
-            suspicion_history = {},
-            last_suspicion = 0,
-        }
-    end
+local function CalculatePrediction(player, strength)
+    local strength_normalized = strength / 100
+    local ticks_ahead = math.floor(1 + strength_normalized * 15)
+    
+    return PredictPlayerPos(player, ticks_ahead)
 end
 
-local function AddAngleToMemory(player, yaw, movement_type, suspicion_score)
-    InitializeAngleMemory(player)
-    local memory = current.angle_memory[player]
-    
-    -- Округляем до 5 градусов
-    local rounded_yaw = math.floor(yaw / 5 + 0.5) * 5
-    
-    if not memory.angles[rounded_yaw] then
-        memory.angles[rounded_yaw] = {count = 0, movement_type = movement_type, suspicion = 0}
-    end
-    
-    -- Добавляем вес если уровень подозрения низкий
-    local weight = 1
-    if suspicion_score and suspicion_score > 50 then
-        weight = 0.3 -- Меньше доверяем фейкам
-    end
-    
-    memory.angles[rounded_yaw].count = memory.angles[rounded_yaw].count + weight
-    memory.angles[rounded_yaw].suspicion = suspicion_score or 0
-    
-    -- Сохраняем историю
-    if not memory.angle_history[movement_type] then
-        memory.angle_history[movement_type] = {}
-    end
-    table.insert(memory.angle_history[movement_type], {yaw = rounded_yaw, tick = globals.tickcount()})
-    
-    -- Удаляем старые записи (более 5 секунд)
-    if #memory.angle_history[movement_type] > 100 then
-        table.remove(memory.angle_history[movement_type], 1)
-    end
-    
-    memory.last_update = globals.tickcount()
-end
+-- ==================== ФИЛЬТРАЦИЯ ЦЕЛЕЙ ====================
 
-local function GetMostUsedAngle(player)
-    if not current.angle_memory[player] then return nil end
-    
-    local memory = current.angle_memory[player]
-    local best_yaw = nil
-    local best_count = 0
-    
-    for yaw, data in pairs(memory.angles) do
-        -- Отфильтровываем углы с высоким подозрением
-        local is_suspicious = data.suspicion and data.suspicion > 50
-        local adjusted_count = is_suspicious and (data.count * 0.5) or data.count
-        
-        if adjusted_count > best_count then
-            best_count = adjusted_count
-            best_yaw = yaw
-        end
-    end
-    
-    -- Используем только если доверие высокое
-    local confidence_threshold = ui.get(misc.confidence_threshold) / 100
-    local confidence = math.min(best_count / 25, 1.0)
-    
-    if confidence < confidence_threshold then
-        return nil, confidence
-    end
-    
-    return best_yaw, confidence
-end
-
-local function ClearOldMemory()
-    for player, data in pairs(current.angle_memory) do
-        if globals.tickcount() - data.last_update > 300 then
-            current.angle_memory[player] = nil
-            current.angle_confidence[player] = nil
-            current.fake_detector[player] = nil
-        end
-    end
-end
-
--- ==================== DEFENSIVE DOUBLE TAP ====================
-
-local function InitializeDDTData(player)
-    if not current.ddt_data[player] then
-        current.ddt_data[player] = {
-            last_shot_tick = 0,
-            last_damage_tick = 0,
-            position_history = {},
-            velocity_history = {},
-            is_active = false,
-            activation_tick = 0,
-        }
-    end
-end
-
-local function StorePosAndVel(player)
-    InitializeDDTData(player)
-    local data = current.ddt_data[player]
-    local tick = globals.tickcount()
-    
-    data.position_history[tick] = GetPlayerPos(player)
-    data.velocity_history[tick] = GetPlayerVelocity(player)
-    
-    for t in pairs(data.position_history) do
-        if tick - t > 20 then
-            data.position_history[t] = nil
-            data.velocity_history[t] = nil
-        end
-    end
-end
-
-local function ActivateDDT(player)
-    InitializeDDTData(player)
-    local data = current.ddt_data[player]
-    data.is_active = true
-    data.activation_tick = globals.tickcount()
-end
-
-local function ProcessDDT(player)
-    if not ui.get(misc.ddt_enable) then return false end
-    
-    InitializeDDTData(player)
-    local data = current.ddt_data[player]
-    local current_tick = globals.tickcount()
-    local ddt_ticks = ui.get(misc.ddt_ticks)
-    local ddt_mode = ui.get(misc.ddt_mode)
-    
-    local should_activate = false
-    
-    if ddt_mode == "On Shot" then
-        local local_player = entity.get_local_player()
-        if local_player then
-            local local_health = entity.get_prop(local_player, "m_iHealth")
-            if local_health and local_health < entity.get_prop(local_player, "m_iMaxHealth") then
-                should_activate = true
-                data.last_damage_tick = current_tick
-            end
-        end
-    elseif ddt_mode == "On Damage" then
-        should_activate = data.is_active or (current_tick - data.activation_tick < 5)
-    elseif ddt_mode == "Always" then
-        should_activate = true
-    end
-    
-    if should_activate then
-        ActivateDDT(player)
-    end
-    
-    if data.is_active and (current_tick - data.activation_tick) < ddt_ticks then
-        return true
-    else
-        data.is_active = false
+local function IsValidTarget(player)
+    if not player or player == entity.get_local_player() then
         return false
     end
-end
-
--- ==================== RESOLVER ====================
-
-local function SmartResolve(player, animstate, delta, yaw1)
-    local movement_type = DetectMovementType(player)
-    local aggressiveness = ui.get(misc.aggressiveness) / 100
     
-    local base_yaw = delta * yaw1 * animstate.m_flPlaybackRate
-    local yaws = base_yaw
-    
-    if movement_type == "jumping" then
-        yaws = base_yaw * (1.2 * aggressiveness)
-    elseif movement_type == "landing" then
-        yaws = base_yaw * (0.8 * aggressiveness)
-    elseif movement_type == "running" then
-        yaws = base_yaw * (1.1 * aggressiveness)
-    elseif movement_type == "standing" then
-        yaws = base_yaw * (0.9 * aggressiveness)
+    if ui.get(aimbot_ui.only_alive) and not entity.is_alive(player) then
+        return false
     end
     
-    return yaws, movement_type
-end
-
-local eye_yaw = 1
-local ent_name = "none"
-local side = -1
-local side2 = -1
-local current_movement = "unknown"
-local memory_used = false
-local ddt_active = false
-local fake_detected = false
-
-local function ResolveJitter(player)
-    local animstate = GetAnimationState(player)
-    if not animstate then return end
-    
-    StorePosAndVel(player)
-    
-    -- Анализируем углы на предмет фейков
-    local angle_analysis = nil
-    if ui.get(misc.anti_fake) then
-        angle_analysis = AnalyzePlayerAngles(player)
+    if ui.get(aimbot_ui.only_visible) and not entity.is_visible(player) then
+        return false
     end
     
-    fake_detected = angle_analysis and angle_analysis.is_likely_fake or false
-    
-    local lpent = get_client_entity(ientitylist, player)
-    local delta = entity.get_prop(player, "m_angEyeAngles[1]") - entity.get_prop(player, "m_flPoseParameter", 11)
-    eye_yaw = animstate.m_flEyeYaw
-    ent_name = entity.get_player_name(player)
-
-    local yaw1 = (entity.get_prop(player, "m_flPoseParameter", 11) or 1) * 116 - 58
-    side = globals.tickcount() % 2 == 0 and -1 or 1
-    side2 = (globals.tickcount() % 3) - 1
-
-    local yaws
-    local resolver_type = ui.get(misc.type)
-    
-    if resolver_type == "Default" then
-        yaws = delta * yaw1 * animstate.m_flPlaybackRate
-    elseif resolver_type == "Jitter" then
-        yaws = side * math.abs(delta * yaw1 * animstate.m_flPlaybackRate)
-    elseif resolver_type == "Alternative" then
-        yaws = side2 * math.abs(delta * yaw1 * animstate.m_flPlaybackRate)
-    elseif resolver_type == "Custom" then
-        yaws = (delta * yaw1 * animstate.m_flPlaybackRate) / ui.get(misc.delta)
-    elseif resolver_type == "Smart" then
-        yaws, current_movement = SmartResolve(player, animstate, delta, yaw1)
+    local player_health = entity.get_prop(player, "m_iHealth")
+    if player_health < ui.get(aimbot_ui.min_health) then
+        return false
     end
-
-    yaws = NormalizeAngle(yaws)
-
-    -- Brute Force с анти-фейк детектором
-    if ui.get(misc.brute_force) then
-        local suspicion = angle_analysis and angle_analysis.suspicion_score or 0
-        AddAngleToMemory(player, yaws, current_movement, suspicion)
-        
-        local best_yaw, confidence = GetMostUsedAngle(player)
-        if best_yaw and confidence and confidence > 0.5 then
-            yaws = best_yaw
-            memory_used = true
-        else
-            memory_used = false
+    
+    if ui.get(aimbot_ui.skip_teammates) then
+        if entity.get_prop(player, "m_iTeamNum") == entity.get_prop(entity.get_local_player(), "m_iTeamNum") then
+            return false
         end
-    else
-        memory_used = false
     end
-
-    -- Defensive Double Tap обработка
-    ddt_active = ProcessDDT(player)
-    if ddt_active then
-        local accuracy = ui.get(misc.ddt_accuracy) / 100
-        yaws = yaws * (0.5 + accuracy * 0.5)
+    
+    if entity.is_dormant(player) or entity.get_prop(player, "m_bDormant") then
+        return false
     end
-
-    plist.set(player, "Force body yaw", true)
-    plist.set(player, "Force body yaw value", yaws)
+    
+    return true
 end
 
-local function Resolver(player)
-    if ui.get(misc.enable) then
-        if entity.is_dormant(player) or entity.get_prop(player, "m_bDormant") then
-            return
-        end
-        ResolveJitter(player)
-    else
-        plist.set(player, "Force body yaw", false)
-    end
-end
+-- ==================== ВЫБОР ЦЕЛИ ====================
 
-local function ResolverUpdate()
-    if current.check_access == false then return end
-    ClearOldMemory()
+local current_target = nil
+
+local function FindBestTarget()
+    local local_player = entity.get_local_player()
+    if not local_player or not entity.is_alive(local_player) then
+        return nil
+    end
+    
+    local best_target = nil
+    local best_score = math.huge
+    local fov_range = ui.get(aimbot_ui.fov)
+    local local_pos = GetPlayerPos(local_player)
+    local local_angles = entity.get_local_player_view_angles()
     
     local enemies = entity.get_players(true)
-    for i, enemy_ent in ipairs(enemies) do
-        if enemy_ent and entity.is_alive(enemy_ent) then
-            Resolver(enemy_ent)
+    
+    for i, enemy in ipairs(enemies) do
+        if IsValidTarget(enemy) then
+            local enemy_pos = GetPlayerPos(enemy)
+            local angles_to_enemy = GetAnglesToPos(local_pos, enemy_pos)
+            
+            local yaw_diff = NormalizeAngle(angles_to_enemy.yaw - local_angles[2])
+            local pitch_diff = NormalizeAngle(angles_to_enemy.pitch - local_angles[1])
+            
+            local angle_diff = math.sqrt(yaw_diff*yaw_diff + pitch_diff*pitch_diff)
+            
+            if angle_diff <= fov_range then
+                local distance = GetDistance(local_player, enemy)
+                local score = angle_diff + (distance / 1000)
+                
+                if score < best_score then
+                    best_score = score
+                    best_target = enemy
+                end
+            end
         end
     end
+    
+    return best_target
 end
 
--- ==================== UI ИНДИКАТОР ====================
+-- ==================== ПЛАВНОСТЬ ====================
+
+local function ApplySmoothing(from_angle, to_angle, smoothness)
+    local smooth_factor = (100 - smoothness) / 100
+    
+    local yaw_diff = NormalizeAngle(to_angle.yaw - from_angle.yaw)
+    local pitch_diff = NormalizeAngle(to_angle.pitch - from_angle.pitch)
+    
+    return {
+        pitch = from_angle.pitch + pitch_diff * smooth_factor,
+        yaw = from_angle.yaw + yaw_diff * smooth_factor,
+    }
+end
+
+local function GetDynamicSmoothness(distance, base_smoothness)
+    local distance_factor = math.min(distance / 3000, 1)
+    return base_smoothness + (distance_factor * 30)
+end
+
+-- ==================== ГЛАВНЫЙ AIMBOT ====================
+
+local last_angles = {pitch = 0, yaw = 0}
+local last_shot_target = nil
+
+local function AimbotThink()
+    if not ui.get(aimbot_ui.enable) then
+        return
+    end
+    
+    if aimbot_config.check_access == false then
+        return
+    end
+    
+    local local_player = entity.get_local_player()
+    if not local_player or not entity.is_alive(local_player) then
+        current_target = nil
+        return
+    end
+    
+    local target = FindBestTarget()
+    
+    if not target then
+        current_target = nil
+        return
+    end
+    
+    current_target = target
+    
+    local local_pos = GetPlayerPos(local_player)
+    local local_angles = entity.get_local_player_view_angles()
+    
+    local target_pos = GetPlayerPos(target)
+    local prediction_used = false
+    
+    if ui.get(aimbot_ui.prediction) then
+        target_pos = CalculatePrediction(target, ui.get(aimbot_ui.prediction_strength))
+        prediction_used = true
+    end
+    
+    local bone = ui.get(aimbot_ui.target_bone)
+    local bone_offset = GetBonePos(target, bone)
+    
+    if bone_offset then
+        target_pos.x = target_pos.x + bone_offset.x
+        target_pos.y = target_pos.y + bone_offset.y
+        target_pos.z = target_pos.z + bone_offset.z
+    end
+    
+    local target_angles = GetAnglesToPos(local_pos, target_pos)
+    
+    local smoothness = ui.get(aimbot_ui.smoothness)
+    
+    if ui.get(aimbot_ui.dynamic_smoothness) then
+        smoothness = GetDynamicSmoothness(target_angles.distance, smoothness)
+    end
+    
+    local final_angles = ApplySmoothing(last_angles, target_angles, smoothness)
+    
+    local recoil_control = ui.get(aimbot_ui.recoil_control) / 100
+    local punch_angles = entity.get_prop(local_player, "m_aimPunchAngle")
+    
+    if punch_angles then
+        final_angles.pitch = final_angles.pitch - (punch_angles[1] * recoil_control)
+        final_angles.yaw = final_angles.yaw - (punch_angles[2] * recoil_control)
+    end
+    
+    last_angles = final_angles
+    
+    -- Рассчитываем угол от центра экрана до цели
+    local yaw_diff = NormalizeAngle(target_angles.yaw - local_angles[2])
+    local pitch_diff = NormalizeAngle(target_angles.pitch - local_angles[1])
+    local fov_angle = math.sqrt(yaw_diff*yaw_diff + pitch_diff*pitch_diff)
+    
+    local mode = ui.get(aimbot_ui.mode)
+    
+    if mode == "Silent" then
+        plist.set(current_target, "Force body yaw", true)
+        plist.set(current_target, "Force body yaw value", final_angles.yaw)
+    elseif mode == "Smooth" or mode == "Flick" then
+        local cmd = user_cmd.get()
+        if cmd then
+            cmd.viewangles = {final_angles.pitch, final_angles.yaw, 0}
+        end
+    end
+    
+    last_shot_target = target
+    
+    -- Логируем выстрел
+    AddShotLog({
+        target = entity.get_player_name(target),
+        distance = target_angles.distance,
+        fov_angle = fov_angle,
+        predicted_angles = target_angles,
+        final_angles = final_angles,
+        mode = mode,
+        bone = bone,
+        prediction_used = prediction_used,
+        smoothness_applied = smoothness,
+    })
+end
+
+-- ==================== UI ИНДИКАТОР И ЛОГИ ====================
 
 local x_ind, y_ind = client.screen_size()
-local function paint_indicator()
-    if current.check_access == false then return end
-    if not ui.get(misc.enable) then return end
-    if entity.get_local_player() == nil or not entity.is_alive(entity.get_local_player()) then return end
+
+local function paint_aimbot()
+    if not ui.get(aimbot_ui.enable) then return end
     
-    local y_offset = y_ind / 1.9
-    renderer.text(20, y_offset, 255, 255, 255, 255, "", 0, "> ResoSense v3 \aEE4444FF[IMPROVED]")
-    renderer.text(20, y_offset + 12, 255, 255, 255, 255, "", 0, "> Type: \aEE4444FF" .. ui.get(misc.type))
+    local y_offset = y_ind / 2
     
-    if ui.get(misc.movement_detection) then
-        renderer.text(20, y_offset + 24, 255, 255, 255, 255, "", 0, "> Movement: \aEE4444FF" .. current_movement)
-    end
-    
-    if ui.get(misc.anti_fake) then
-        local fake_status = fake_detected and "\aFF0000FF[FAKE]" or "\a00FF00FF[REAL]"
-        renderer.text(20, y_offset + 36, 255, 255, 255, 255, "", 0, "> Anti-Fake: " .. fake_status)
-    end
-    
-    if ui.get(misc.brute_force) then
-        local memory_status = memory_used and "\a00FF00FF[USING]" or "\aFFFFFFFF[learning]"
-        renderer.text(20, y_offset + 48, 255, 255, 255, 255, "", 0, "> Brute Force: " .. memory_status)
-    end
-    
-    if ui.get(misc.ddt_enable) then
-        local ddt_status = ddt_active and "\a00FF00FF[ACTIVE]" or "\aFFFFFFFF[ready]"
-        renderer.text(20, y_offset + 60, 255, 255, 255, 255, "", 0, "> DDT: " .. ddt_status)
-        renderer.text(20, y_offset + 72, 255, 255, 255, 255, "", 0, "> Enemy: \aEE4444FF" .. ent_name)
-        renderer.text(20, y_offset + 84, 255, 255, 255, 255, "", 0, "> Eye: \aEE4444FF" .. math.floor(eye_yaw))
+    if current_target then
+        local target_name = entity.get_player_name(current_target)
+        local distance = GetDistance(entity.get_local_player(), current_target)
+        
+        renderer.text(20, y_offset, 0, 255, 0, 255, "", 0, "> Aimbot: \a00FF00FF[ACTIVE]")
+        renderer.text(20, y_offset + 12, 255, 255, 255, 255, "", 0, "> Target: \aEE4444FF" .. target_name)
+        renderer.text(20, y_offset + 24, 255, 255, 255, 255, "", 0, "> Distance: \aEE4444FF" .. math.floor(distance) .. "u")
+        renderer.text(20, y_offset + 36, 255, 255, 255, 255, "", 0, "> Mode: \aEE4444FF" .. ui.get(aimbot_ui.mode))
     else
-        renderer.text(20, y_offset + 60, 255, 255, 255, 255, "", 0, "> Enemy: \aEE4444FF" .. ent_name)
-        renderer.text(20, y_offset + 72, 255, 255, 255, 255, "", 0, "> Eye: \aEE4444FF" .. math.floor(eye_yaw))
+        renderer.text(20, y_offset, 255, 100, 100, 255, "", 0, "> Aimbot: \aFFFFFFFF[No target]")
+    end
+    
+    -- Отображаем логи
+    if ui.get(aimbot_ui.show_log_panel) and ui.get(aimbot_ui.enable_logging) then
+        local log_x = 20
+        local log_y = y_ind - 300
+        
+        renderer.text(log_x, log_y, 200, 200, 255, 255, "", 0, "=== AIMBOT LOG ===")
+        
+        local start_index = math.max(1, #aimbot_config.shot_log - 10)
+        local y_pos = log_y + 15
+        
+        for i = start_index, #aimbot_config.shot_log do
+            local log_entry = aimbot_config.shot_log[i]
+            local log_string = GetLogString(log_entry)
+            
+            -- Выбираем цвет в зависимости от попадания
+            local r, g, b = 255, 100, 100 -- Красный для промаха
+            if log_entry.hit then
+                r, g, b = 100, 255, 100 -- Зелёный для попадания
+            end
+            
+            renderer.text(log_x, y_pos, r, g, b, 255, "", 0, log_string)
+            y_pos = y_pos + 12
+        end
+        
+        renderer.text(log_x, y_pos + 5, 150, 150, 150, 255, "", 0, string.format("Total shots: %d", #aimbot_config.shot_log))
     end
 end
 
 -- ==================== УПРАВЛЕНИЕ UI ====================
 
 local function visibility()
-    ui.set_visible(misc.enable, current.check_access)
-    ui.set_visible(misc.type, ui.get(misc.enable) and current.check_access)
-    ui.set_visible(misc.delta, ui.get(misc.type) == "Custom" and ui.get(misc.enable) and current.check_access)
-    ui.set_visible(misc.brute_force, ui.get(misc.enable) and current.check_access)
-    ui.set_visible(misc.anti_fake, ui.get(misc.enable) and current.check_access)
-    ui.set_visible(misc.confidence_threshold, ui.get(misc.brute_force) and ui.get(misc.enable) and current.check_access)
-    ui.set_visible(misc.movement_detection, ui.get(misc.enable) and current.check_access)
-    ui.set_visible(misc.aggressiveness, ui.get(misc.type) == "Smart" and ui.get(misc.enable) and current.check_access)
+    ui.set_visible(aimbot_ui.enable, true)
+    ui.set_visible(aimbot_ui.mode, ui.get(aimbot_ui.enable))
+    ui.set_visible(aimbot_ui.fov, ui.get(aimbot_ui.enable))
+    ui.set_visible(aimbot_ui.smoothness, ui.get(aimbot_ui.enable))
+    ui.set_visible(aimbot_ui.target_bone, ui.get(aimbot_ui.enable))
+    ui.set_visible(aimbot_ui.prediction, ui.get(aimbot_ui.enable))
+    ui.set_visible(aimbot_ui.prediction_strength, ui.get(aimbot_ui.enable) and ui.get(aimbot_ui.prediction))
+    ui.set_visible(aimbot_ui.only_visible, ui.get(aimbot_ui.enable))
+    ui.set_visible(aimbot_ui.only_alive, ui.get(aimbot_ui.enable))
+    ui.set_visible(aimbot_ui.skip_teammates, ui.get(aimbot_ui.enable))
+    ui.set_visible(aimbot_ui.min_health, ui.get(aimbot_ui.enable))
+    ui.set_visible(aimbot_ui.dynamic_smoothness, ui.get(aimbot_ui.enable))
+    ui.set_visible(aimbot_ui.distance_smoothing, ui.get(aimbot_ui.enable))
+    ui.set_visible(aimbot_ui.recoil_control, ui.get(aimbot_ui.enable))
     
-    -- DDT видимость
-    ui.set_visible(misc.ddt_enable, current.check_access)
-    ui.set_visible(misc.ddt_mode, ui.get(misc.ddt_enable) and current.check_access)
-    ui.set_visible(misc.ddt_ticks, ui.get(misc.ddt_enable) and current.check_access)
-    ui.set_visible(misc.ddt_accuracy, ui.get(misc.ddt_enable) and current.check_access)
+    ui.set_visible(aimbot_ui.enable_logging, ui.get(aimbot_ui.enable))
+    ui.set_visible(aimbot_ui.log_detail_level, ui.get(aimbot_ui.enable_logging) and ui.get(aimbot_ui.enable))
+    ui.set_visible(aimbot_ui.show_log_panel, ui.get(aimbot_ui.enable_logging) and ui.get(aimbot_ui.enable))
 end
 
 -- ==================== СОБЫТИЯ ====================
 
 client.set_event_callback("paint_ui", visibility)
-client.set_event_callback("paint", paint_indicator)
-client.set_event_callback("setup_command", ResolverUpdate)
+client.set_event_callback("paint", paint_aimbot)
+client.set_event_callback("setup_command", AimbotThink)
